@@ -324,6 +324,8 @@ def train(
 
             unsup_loss = 0 * rep.sum()
             contra_loss = 0 * rep.sum()
+            reliable_ratio_lcr = 0 * rep.sum()
+            lcr_loss =  0 * rep.sum()
         else:
             if epoch == cfg["trainer"].get("sup_only_epoch", 1):
                 # copy student parameters to teacher
