@@ -36,6 +36,7 @@ from gta.utils.utils import (
     load_state,
     set_random_seed,
 )
+from gta.utils.mask import RandomMaskGenerator
 
 parser = argparse.ArgumentParser(description="Semi-Supervised Semantic Segmentation")
 parser.add_argument("--config", type=str, default="config.yaml")
@@ -276,12 +277,15 @@ def train(
 
     sup_losses = AverageMeter(10)
     uns_losses = AverageMeter(10)
+    lcr_losses = AverageMeter(10)
+    reliable_ratio_lcr_meter = AverageMeter(10)
     con_losses = AverageMeter(10)
     data_times = AverageMeter(10)
     batch_times = AverageMeter(10)
     learning_rates = AverageMeter(10)
 
     batch_end = time.time()
+    mask_gen = RandomMaskGenerator(cfg["trainer"]["lcr"]["mask_ratio"], cfg["trainer"]["lcr"]["patch_size"])
     for step in range(len(loader_l)):
         batch_start = time.time()
         data_times.update(batch_start - batch_end)
@@ -343,6 +347,10 @@ def train(
             pred_u_teacher = F.softmax(pred_u_teacher, dim=1)
             logits_u_aug, label_u_aug = torch.max(pred_u_teacher, dim=1)
 
+            image_u_mask = mask_gen(image_u)
+            logits_u_mask, label_u_mask = logits_u_aug.detach().clone(), label_u_aug.detach().clone()
+            num_unlabeled, c, h, w = image_u.shape
+
             # apply strong data augmentation: cutout, cutmix, or classmix
             if np.random.uniform(0, 1) < 0.5 and cfg["trainer"]["unsupervised"].get(
                 "apply_aug", False
@@ -358,11 +366,13 @@ def train(
 
             # forward
             num_labeled = len(image_l)
-            image_all = torch.cat((image_l, image_u_aug))
+            image_all = torch.cat((image_l, image_u_aug, image_u_mask))
             outs_ta = model_ta(image_all)
             
-            pred_a_all, rep_a_all = outs_ta["pred"], outs_ta["rep"]
+
+            pred_a_all, rep_a_all = outs_ta["pred"][:num_labeled+num_unlabeled], outs_ta["rep"][:num_labeled+num_unlabeled]
             pred_a_l, pred_a_u = pred_a_all[:num_labeled], pred_a_all[num_labeled:]
+            pred_a_m = outs_ta["pred"][num_labeled+num_unlabeled:]
             if "aux_loss" in cfg["net"].keys():
                 aux_ta = outs_ta["aux"]
 
@@ -371,6 +381,9 @@ def train(
             # )
             pred_a_u_large = F.interpolate(
                 pred_a_u, size=(h, w), mode="bilinear", align_corners=True
+            )
+            pred_a_m_large = F.interpolate(
+                pred_a_m, size=(h, w), mode="bilinear", align_corners=True
             )
 
             # teacher forward
@@ -384,7 +397,7 @@ def train(
                 #     prob_all_teacher[num_labeled:],
                 # )
 
-                pred_u_teacher = pred_all_teacher[num_labeled:]
+                pred_u_teacher = pred_all_teacher[num_labeled:num_labeled+num_unlabeled]
                 pred_u_large_teacher = F.interpolate(
                     pred_u_teacher, size=(h, w), mode="bilinear", align_corners=True
                 )
@@ -400,9 +413,18 @@ def train(
                 * cfg["trainer"]["unsupervised"].get("loss_weight", 1)
             ) + 0.0 * rep_a_all.sum()
 
+            # lcr loss
+            conf_threshold = cfg["trainer"]["lcr"]["conf_threshold"]
+            with torch.no_grad():
+                reliable_mask_lcr = logits_u_mask.ge(conf_threshold).bool() * (label_u_aug != 255).bool()
+                reliable_ratio_lcr = torch.sum(reliable_mask_lcr.bool()) / (num_unlabeled * h * w)
+                label_u_mask[~reliable_mask_lcr] = 255 
+            lcr_loss = F.cross_entropy(pred_a_m_large, label_u_mask, ignore_index=255) * cfg["trainer"]["lcr"]["weight"]
+
+            loss1 = unsup_loss + lcr_loss
 
             optimizer_ta.zero_grad()
-            unsup_loss.backward()
+            loss1.backward()
             optimizer_ta.step()
 
             model.eval()
@@ -428,7 +450,7 @@ def train(
             model.train()
 
             outs = model(image_all)
-            pred_all, rep_all = outs["pred"], outs["rep"]
+            pred_all, rep_all = outs["pred"][:num_labeled+num_unlabeled], outs["rep"][:num_labeled+num_unlabeled]
             pred_l, pred_u = pred_all[:num_labeled], pred_all[num_labeled:]
 
             pred_l_large = F.interpolate(
@@ -480,6 +502,14 @@ def train(
         dist.all_reduce(reduced_uns_loss)
         uns_losses.update(reduced_uns_loss.item())
 
+        reduced_lcr_loss = lcr_loss.clone().detach()
+        dist.all_reduce(reduced_lcr_loss)
+        lcr_losses.update(reduced_lcr_loss.item())
+
+        reduced_reliable_ratio_lcr = reliable_ratio_lcr.clone().detach()
+        dist.all_reduce(reduced_reliable_ratio_lcr)
+        reliable_ratio_lcr_meter.update(reduced_reliable_ratio_lcr.item() / world_size)
+
         reduced_con_loss = 0.0
         con_losses.update(0.0)
 
@@ -494,6 +524,8 @@ def train(
                 "Time {batch_time.val:.2f} ({batch_time.avg:.2f})\t"
                 "Sup {sup_loss.val:.3f} ({sup_loss.avg:.3f})\t"
                 "Uns {uns_loss.val:.3f} ({uns_loss.avg:.3f})\t"
+                "LCR {lcr_loss.val:.3f} ({lcr_loss.avg:.3f})\t"
+                "Reliable {reliable_ratio_lcr_meter.val:.3f} ({reliable_ratio_lcr_meter.avg:.3f})\t"
                 "Con {con_loss.val:.3f} ({con_loss.avg:.3f})\t"
                 "LR {lr.val:.5f}".format(
                     cfg["dataset"]["n_sup"],
@@ -503,6 +535,8 @@ def train(
                     batch_time=batch_times,
                     sup_loss=sup_losses,
                     uns_loss=uns_losses,
+                    lcr_loss=lcr_losses,
+                    reliable_ratio_lcr_meter=reliable_ratio_lcr_meter,
                     con_loss=con_losses,
                     lr=learning_rates,
                 )
@@ -511,6 +545,7 @@ def train(
             tb_logger.add_scalar("lr", learning_rates.val, i_iter)
             tb_logger.add_scalar("Sup Loss", sup_losses.val, i_iter)
             tb_logger.add_scalar("Uns Loss", uns_losses.val, i_iter)
+            tb_logger.add_scalar("LCR Loss", lcr_losses.val, i_iter)
             tb_logger.add_scalar("Con Loss", con_losses.val, i_iter)
 
 

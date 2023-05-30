@@ -1,12 +1,12 @@
 #!/bin/bash
 now=$(date +"%Y%m%d_%H%M%S")
-job='183_semi'
+job='1464_semi'
 ROOT=../../../..
 
 mkdir -p log
 
 # use torch.distributed.launch
-CUDA_VISIBLE_DEVICES=0,3,4,5 python -m torch.distributed.launch \
+python -m torch.distributed.launch \
     --nproc_per_node=$1 \
     --nnodes=1 \
     --node_rank=0 \

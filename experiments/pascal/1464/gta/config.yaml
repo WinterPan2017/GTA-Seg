@@ -2,7 +2,7 @@ dataset: # Required.
   type: pascal_semi
   train:
     data_root: ../../../../data/VOC2012
-    data_list: ../../../../data/splits/pascal/183/labeled.txt
+    data_list: ../../../../data/splits/pascal/1464/labeled.txt
     flip: True
     GaussianBlur: False
     rand_resize: [0.5, 2.0]
@@ -16,8 +16,8 @@ dataset: # Required.
     crop:
       type: center
       size: [513, 513] # crop image with HxW size
-  batch_size: 3
-  n_sup: 183
+  batch_size: 4
+  n_sup: 1464
   noise_std: 0.1
   workers: 2
   mean: [123.675, 116.28, 103.53]
@@ -52,7 +52,7 @@ trainer: # Required.
   #   num_negatives: 50
   #   num_queries: 256
   #   temperature: 0.5
-  sup_only_epoch: 0
+  sup_only_epoch: 1
 
 saver:
   snapshot_dir: checkpoints
